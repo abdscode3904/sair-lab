@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Sair Lab | Dashboard</title>
+
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body class="dashboard-page">
+
+<nav class="navbar">
+    <div class="nav-container">
+        <a href="index.html" class="brand">SAIR LAB</a>
+
+        <div class="nav-actions">
+            <a href="index.html" class="nav-link">Home</a>
+            <button id="logoutButton" class="nav-button">Logout</button>
+        </div>
+    </div>
+</nav>
+
+<main class="dashboard-container">
+
+    <section class="dashboard-header">
+        <div>
+            <span class="eyebrow">WORKSPACE</span>
+            <h1>Data Automation Dashboard</h1>
+            <p>
+                Upload your Excel or CSV file, choose an operation,
+                and let Sair Lab process it automatically.
+            </p>
+        </div>
+    </section>
+
+    <section class="dashboard-grid">
+
+        <!-- USER / USAGE -->
+        <div class="dashboard-card usage-card">
+
+            <div class="card-heading">
+                <div>
+                    <span class="card-label">ACCOUNT</span>
+                    <h2 id="userEmail">Loading...</h2>
+                </div>
+
+                <span id="planBadge" class="plan-badge">FREE</span>
+            </div>
+
+            <div class="usage-info">
+
+                <div class="usage-row">
+                    <span>Jobs used</span>
+                    <strong id="jobsUsed">0</strong>
+                </div>
+
+                <div class="usage-row">
+                    <span>Jobs remaining</span>
+                    <strong id="jobsRemaining">0</strong>
+                </div>
+
+            </div>
+
+        </div>
+
+        <!-- UPLOAD -->
+        <div class="dashboard-card upload-card">
+
+            <div class="card-heading">
+                <div>
+                    <span class="card-label">NEW JOB</span>
+                    <h2>Upload your file</h2>
+                </div>
+            </div>
+
+            <form id="jobForm">
+
+                <label class="upload-box" for="fileInput">
+
+                    <input
+                        type="file"
+                        id="fileInput"
+                        accept=".csv,.xlsx"
+                        hidden
+                    >
+
+                    <div class="upload-icon">↑</div>
+
+                    <strong id="fileName">
+                        Choose Excel or CSV file
+                    </strong>
+
+                    <span>
+                        .xlsx or .csv · Maximum 25 MB
+                    </span>
+
+                </label>
+
+                <div class="form-group">
+
+                    <label for="operation">
+                        Automation operation
+                    </label>
+
+                    <select id="operation" required>
+
+                        <option value="">
+                            Select an operation
+                        </option>
+
+                        <option value="clean">
+                            Clean Data
+                        </option>
+
+                        <option value="format">
+                            Format Excel
+                        </option>
+
+                        <option value="report">
+                            Create Report
+                        </option>
+
+                        <option value="csv_to_excel">
+                            CSV → Excel
+                        </option>
+
+                        <option value="excel_to_csv">
+                            Excel → CSV
+                        </option>
+
+                        <option value="merge_csv">
+                            Merge CSV
+                        </option>
+
+                        <option value="merge_excel">
+                            Merge Excel
+                        </option>
+
+                    </select>
+
+                </div>
+
+                <button
+                    type="submit"
+                    id="processButton"
+                    class="auth-button"
+                >
+                    Process File
+                </button>
+
+                <div
+                    id="jobMessage"
+                    class="form-message"
+                ></div>
+
+            </form>
+
+        </div>
+
+    </section>
+
+    <!-- CURRENT JOB -->
+    <section
+        id="jobSection"
+        class="dashboard-card job-card hidden"
+    >
+
+        <div class="card-heading">
+
+            <div>
+                <span class="card-label">JOB STATUS</span>
+                <h2 id="jobId">Job</h2>
+            </div>
+
+            <span
+                id="jobStatus"
+                class="status-badge"
+            >
+                QUEUED
+            </span>
+
+        </div>
+
+        <div class="job-progress">
+
+            <div class="progress-track">
+                <div
+                    id="progressBar"
+                    class="progress-bar"
+                ></div>
+            </div>
+
+            <p id="jobStatusText">
+                Your file is waiting to be processed...
+            </p>
+
+        </div>
+
+        <a
+            id="downloadButton"
+            class="download-button hidden"
+            href="#"
+        >
+            Download Result
+        </a>
+
+    </section>
+
+</main>
+
+<script src="js/api.js"></script>
+<script src="js/dashboard.js"></script>
+
+</body>
+</html>

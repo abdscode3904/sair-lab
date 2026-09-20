@@ -1,0 +1,814 @@
+from __future__ import annotations
+
+import shutil
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
+
+from fastapi.responses import FileResponse
+
+from backend.api.auth import (
+    get_current_user,
+    router as auth_router,
+)
+
+from backend.api.security import (
+    MAX_UPLOAD_SIZE,
+    ensure_inside_directory,
+    generate_storage_filename,
+    validate_file_signature,
+    validate_file_size,
+    validate_operation,
+    validate_upload,
+)
+
+from backend.jobs.job_manager import JobManager
+from backend.jobs.job_processor import JobProcessor
+from backend.jobs.job_queue import JobQueue
+from backend.jobs.worker import JobWorker
+
+from backend.services.usage_service import (
+    ensure_customer,
+    can_create_job,
+    record_job_usage,
+    get_usage_summary,
+)
+from fastapi.middleware.cors import CORSMiddleware
+
+# =========================================================
+# PROJECT PATHS
+# =========================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+STORAGE_DIR = PROJECT_ROOT / "storage"
+UPLOADS_DIR = STORAGE_DIR / "uploads"
+OUTPUTS_DIR = STORAGE_DIR / "outputs"
+JOBS_DIR = STORAGE_DIR / "jobs"
+
+
+UPLOADS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+OUTPUTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+JOBS_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+# =========================================================
+# CORE SERVICES
+# =========================================================
+
+job_manager = JobManager(
+    jobs_directory=JOBS_DIR
+)
+
+job_queue = JobQueue()
+
+job_processor = JobProcessor(
+    job_manager=job_manager,
+    project_root=PROJECT_ROOT,
+)
+
+worker = JobWorker(
+    job_queue=job_queue,
+    job_processor=job_processor,
+)
+
+
+# =========================================================
+# FASTAPI LIFESPAN
+# =========================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Start the background worker when the API starts
+    and stop it cleanly when the API shuts down.
+    """
+
+    worker.start()
+
+    try:
+        yield
+
+    finally:
+        worker.stop()
+
+
+# =========================================================
+# FASTAPI APPLICATION
+# =========================================================
+
+app = FastAPI(
+    title="Sair Lab API",
+    description="Sair Lab Excel and CSV Automation SaaS API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(auth_router)
+
+
+# =========================================================
+# ROOT
+# =========================================================
+
+@app.get("/")
+def root():
+    return {
+        "success": True,
+        "service": "Sair Lab API",
+        "version": "1.0.0",
+        "status": "running",
+    }
+
+
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.get("/health")
+def health():
+    return {
+        "success": True,
+        "status": "healthy",
+        "worker_running": worker.is_running(),
+        "queued_jobs": job_queue.size(),
+    }
+
+
+# =========================================================
+# USAGE
+# =========================================================
+
+@app.get("/api/usage")
+def get_usage(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Return the authenticated user's monthly usage,
+    plan information, and remaining jobs.
+    """
+
+    customer_id = current_user["customer_id"]
+
+    usage = get_usage_summary(
+        customer_id
+    )
+
+    return {
+        "success": True,
+        "usage": usage,
+    }
+
+
+# =========================================================
+# UPLOAD + CREATE JOB
+# =========================================================
+
+@app.post("/api/jobs/upload")
+async def upload_job(
+    file: UploadFile = File(...),
+    operation: str = Form("clean"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Secure authenticated upload endpoint.
+
+    Authentication flow:
+
+        JWT
+          ↓
+        current_user
+          ↓
+        customer_id from JWT
+          ↓
+        server-side plan
+          ↓
+        usage/quota check
+          ↓
+        save upload
+          ↓
+        validate file
+          ↓
+        create job
+          ↓
+        record usage
+          ↓
+        queue job
+          ↓
+        worker processes job
+    """
+
+    # -----------------------------------------------------
+    # AUTHENTICATED CUSTOMER
+    # -----------------------------------------------------
+
+    normalized_customer_id = (
+        current_user["customer_id"]
+    )
+
+    if not normalized_customer_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Authenticated customer is invalid.",
+        )
+
+    # -----------------------------------------------------
+    # CUSTOMER / SERVER-SIDE PLAN
+    # -----------------------------------------------------
+
+    customer = ensure_customer(
+        normalized_customer_id
+    )
+
+    customer_plan = customer["plan"]
+
+    # -----------------------------------------------------
+    # FILENAME
+    # -----------------------------------------------------
+
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename is required.",
+        )
+
+    original_filename = Path(
+        file.filename
+    ).name
+
+    # -----------------------------------------------------
+    # OPERATION
+    # -----------------------------------------------------
+
+    try:
+        operation = validate_operation(
+            operation
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    # -----------------------------------------------------
+    # INITIAL FILENAME VALIDATION
+    # -----------------------------------------------------
+
+    try:
+        upload_info = validate_upload(
+            original_filename,
+            0,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    extension = upload_info["extension"]
+
+    # -----------------------------------------------------
+    # SAVE UPLOAD
+    # -----------------------------------------------------
+
+    storage_filename = generate_storage_filename(
+        "TEMP",
+        extension,
+    )
+
+    temp_path = UPLOADS_DIR / storage_filename
+
+    try:
+        temp_path = ensure_inside_directory(
+            temp_path,
+            UPLOADS_DIR,
+        )
+
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsafe upload path.",
+        )
+
+    total_size = 0
+
+    try:
+        with open(
+            temp_path,
+            "wb",
+        ) as buffer:
+
+            while True:
+
+                chunk = await file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+
+                if total_size > MAX_UPLOAD_SIZE:
+                    raise ValueError(
+                        "File is too large. "
+                        "Maximum allowed size is 25 MB."
+                    )
+
+                buffer.write(chunk)
+
+    except ValueError as exc:
+
+        if temp_path.exists():
+            temp_path.unlink()
+
+        raise HTTPException(
+            status_code=413,
+            detail=str(exc),
+        )
+
+    except Exception:
+
+        if temp_path.exists():
+            temp_path.unlink()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to save uploaded file.",
+        )
+
+    finally:
+        await file.close()
+
+    # -----------------------------------------------------
+    # FINAL SIZE VALIDATION
+    # -----------------------------------------------------
+
+    try:
+
+        validate_file_size(
+            total_size
+        )
+
+    except ValueError as exc:
+
+        if temp_path.exists():
+            temp_path.unlink()
+
+        raise HTTPException(
+            status_code=413,
+            detail=str(exc),
+        )
+
+    # -----------------------------------------------------
+    # USAGE LIMIT CHECK
+    # -----------------------------------------------------
+
+    allowed, usage_message = can_create_job(
+        normalized_customer_id,
+        total_size,
+    )
+
+    if not allowed:
+
+        if temp_path.exists():
+            temp_path.unlink()
+
+        if (
+            "file" in usage_message.lower()
+            or "size" in usage_message.lower()
+            or "mb" in usage_message.lower()
+        ):
+
+            raise HTTPException(
+                status_code=413,
+                detail=usage_message,
+            )
+
+        raise HTTPException(
+            status_code=429,
+            detail=usage_message,
+        )
+
+    # -----------------------------------------------------
+    # CREATE JOB
+    # -----------------------------------------------------
+
+    job = job_manager.create_job(
+        customer_id=normalized_customer_id,
+        package=customer_plan,
+        operation=operation,
+    )
+
+    job_id = job["job_id"]
+
+    # -----------------------------------------------------
+    # FINAL INTERNAL FILENAME
+    # -----------------------------------------------------
+
+    final_storage_filename = generate_storage_filename(
+        job_id,
+        extension,
+    )
+
+    input_path = (
+        UPLOADS_DIR / final_storage_filename
+    )
+
+    try:
+
+        input_path = ensure_inside_directory(
+            input_path,
+            UPLOADS_DIR,
+        )
+
+    except ValueError as exc:
+
+        if temp_path.exists():
+            temp_path.unlink()
+
+        job_manager.fail_job(
+            job_id,
+            str(exc),
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail="Unsafe upload path.",
+        )
+
+    # -----------------------------------------------------
+    # MOVE TEMP FILE TO FINAL JOB FILE
+    # -----------------------------------------------------
+
+    try:
+
+        shutil.move(
+            str(temp_path),
+            str(input_path),
+        )
+
+    except Exception as exc:
+
+        if temp_path.exists():
+            temp_path.unlink()
+
+        job_manager.fail_job(
+            job_id,
+            f"Failed to finalize upload: {exc}",
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to finalize uploaded file.",
+        )
+
+    # -----------------------------------------------------
+    # ACTUAL FILE VALIDATION
+    # -----------------------------------------------------
+
+    try:
+
+        validate_file_signature(
+            input_path,
+            extension,
+        )
+
+    except ValueError as exc:
+
+        if input_path.exists():
+            input_path.unlink()
+
+        job_manager.fail_job(
+            job_id,
+            str(exc),
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    # -----------------------------------------------------
+    # SAVE JOB INPUT METADATA
+    # -----------------------------------------------------
+
+    job_manager.update_job(
+        job_id,
+        {
+            "input": {
+                "file_name": original_filename,
+                "file_path": str(input_path),
+                "size_bytes": total_size,
+            }
+        },
+    )
+
+    # -----------------------------------------------------
+    # ADD TO QUEUE
+    # -----------------------------------------------------
+
+    added = job_queue.add(
+        job_id
+    )
+
+    if not added:
+
+        if input_path.exists():
+            input_path.unlink()
+
+        job_manager.fail_job(
+            job_id,
+            "Job could not be added to queue.",
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to queue job.",
+        )
+
+    # -----------------------------------------------------
+    # RECORD USAGE
+    # -----------------------------------------------------
+
+    try:
+
+        record_job_usage(
+            normalized_customer_id,
+            total_size,
+        )
+
+    except Exception as exc:
+
+        print(
+            f"WARNING: Failed to record usage "
+            f"for {normalized_customer_id}: {exc}"
+        )
+
+    # -----------------------------------------------------
+    # USAGE SUMMARY
+    # -----------------------------------------------------
+
+    usage = None
+
+    try:
+
+        usage = get_usage_summary(
+            normalized_customer_id
+        )
+
+    except Exception:
+
+        usage = None
+
+    # -----------------------------------------------------
+    # RESPONSE
+    # -----------------------------------------------------
+
+    current_job = job_manager.get_job(
+        job_id
+    )
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": current_job["status"],
+        "operation": operation,
+        "file_name": original_filename,
+        "size_bytes": total_size,
+        "max_upload_size": MAX_UPLOAD_SIZE,
+        "plan": customer_plan,
+        "customer_id": normalized_customer_id,
+        "usage": usage,
+    }
+
+
+# =========================================================
+# GET SINGLE JOB
+# =========================================================
+
+@app.get("/api/jobs/{job_id}")
+def get_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Return a job only if it belongs to the authenticated
+    customer.
+    """
+
+    job = job_manager.get_job(
+        job_id
+    )
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found.",
+        )
+
+    customer_id = current_user["customer_id"]
+
+    if job["customer_id"] != customer_id:
+        # Return 404 rather than revealing that the job exists.
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found.",
+        )
+
+    return {
+        "success": True,
+        "job": job,
+    }
+
+
+# =========================================================
+# LIST CURRENT USER'S JOBS
+# =========================================================
+
+@app.get("/api/jobs")
+def list_jobs(
+    status: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Return only jobs belonging to the authenticated customer.
+
+    The client cannot provide another customer_id.
+    """
+
+    customer_id = current_user["customer_id"]
+
+    jobs = job_manager.list_jobs(
+        status=status,
+        customer_id=customer_id,
+    )
+
+    return {
+        "success": True,
+        "count": len(jobs),
+        "jobs": jobs,
+    }
+
+
+# =========================================================
+# QUEUE STATUS
+# =========================================================
+
+@app.get("/api/queue")
+def queue_status():
+    """
+    Basic worker/queue health information.
+
+    This endpoint does not expose customer files or job data.
+    """
+
+    return {
+        "success": True,
+        "queue": worker.stats(),
+    }
+
+
+# =========================================================
+# DOWNLOAD
+# =========================================================
+
+@app.get("/api/jobs/{job_id}/download")
+def download_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Download a completed job only if the job belongs to
+    the authenticated customer.
+    """
+
+    job = job_manager.get_job(
+        job_id
+    )
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found.",
+        )
+
+    # -----------------------------------------------------
+    # CUSTOMER OWNERSHIP CHECK
+    # -----------------------------------------------------
+
+    customer_id = current_user["customer_id"]
+
+    if job["customer_id"] != customer_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found.",
+        )
+
+    # -----------------------------------------------------
+    # COMPLETION CHECK
+    # -----------------------------------------------------
+
+    if job["status"] != "COMPLETED":
+
+        raise HTTPException(
+            status_code=409,
+            detail="Job is not completed yet.",
+        )
+
+    output = job.get(
+        "output",
+        {},
+    )
+
+    output_path = output.get(
+        "file_path"
+    )
+
+    if not output_path:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Output file not found.",
+        )
+
+    # -----------------------------------------------------
+    # DOWNLOAD PATH SECURITY
+    # -----------------------------------------------------
+
+    try:
+
+        output_file = ensure_inside_directory(
+            output_path,
+            OUTPUTS_DIR,
+        )
+
+    except ValueError:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Unsafe output path.",
+        )
+
+    # -----------------------------------------------------
+    # FILE EXISTS
+    # -----------------------------------------------------
+
+    if not output_file.exists():
+
+        raise HTTPException(
+            status_code=404,
+            detail="Output file no longer exists.",
+        )
+
+    # -----------------------------------------------------
+    # FILE NOT EMPTY
+    # -----------------------------------------------------
+
+    if output_file.stat().st_size == 0:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Output file is empty.",
+        )
+
+    # -----------------------------------------------------
+    # RETURN FILE
+    # -----------------------------------------------------
+
+    return FileResponse(
+        path=output_file,
+        filename=output_file.name,
+        media_type="application/octet-stream",
+    )
