@@ -1,6 +1,4 @@
-const API_BASE_URL = "http://127.0.0.1:8000";
-
-
+const API_BASE_URL = "https://sair-lab.onrender.com";
 async function apiRequest(
     endpoint,
     options = {}
