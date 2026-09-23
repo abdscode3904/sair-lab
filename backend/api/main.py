@@ -15,6 +15,7 @@ from fastapi import (
 )
 
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.auth import (
     get_current_user,
@@ -42,7 +43,7 @@ from backend.services.usage_service import (
     record_job_usage,
     get_usage_summary,
 )
-from fastapi.middleware.cors import CORSMiddleware
+
 
 # =========================================================
 # PROJECT PATHS
@@ -123,16 +124,33 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+# =========================================================
+# CORS
+# =========================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        # Local development
         "http://127.0.0.1:5500",
         "http://localhost:5500",
+        "http://[::1]:5500",
+
+        # Render API / future public frontend support
+        "https://sair-lab.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =========================================================
+# ROUTERS
+# =========================================================
+
 app.include_router(auth_router)
 
 
@@ -376,7 +394,6 @@ async def upload_job(
     # -----------------------------------------------------
 
     try:
-
         validate_file_size(
             total_size
         )
@@ -447,7 +464,6 @@ async def upload_job(
     )
 
     try:
-
         input_path = ensure_inside_directory(
             input_path,
             UPLOADS_DIR,
@@ -473,7 +489,6 @@ async def upload_job(
     # -----------------------------------------------------
 
     try:
-
         shutil.move(
             str(temp_path),
             str(input_path),
@@ -499,7 +514,6 @@ async def upload_job(
     # -----------------------------------------------------
 
     try:
-
         validate_file_signature(
             input_path,
             extension,
@@ -563,7 +577,6 @@ async def upload_job(
     # -----------------------------------------------------
 
     try:
-
         record_job_usage(
             normalized_customer_id,
             total_size,
@@ -583,13 +596,11 @@ async def upload_job(
     usage = None
 
     try:
-
         usage = get_usage_summary(
             normalized_customer_id
         )
 
     except Exception:
-
         usage = None
 
     # -----------------------------------------------------
@@ -641,7 +652,6 @@ def get_job(
     customer_id = current_user["customer_id"]
 
     if job["customer_id"] != customer_id:
-        # Return 404 rather than revealing that the job exists.
         raise HTTPException(
             status_code=404,
             detail="Job not found.",
@@ -768,7 +778,6 @@ def download_job(
     # -----------------------------------------------------
 
     try:
-
         output_file = ensure_inside_directory(
             output_path,
             OUTPUTS_DIR,
